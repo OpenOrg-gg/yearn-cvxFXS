@@ -1,35 +1,51 @@
-import pytest
+import brownie
+from brownie import Contract
+from brownie import config
+import math
 
 
 def test_revoke_strategy_from_vault(
-    chain, token, vault, strategy, amount, user, gov, RELATIVE_APPROX
+    gov,
+    token,
+    vault,
+    whale,
+    chain,
+    strategy,
+    amount,
 ):
-    # Deposit to the vault and harvest
-    token.approve(vault.address, amount, {"from": user})
-    vault.deposit(amount, {"from": user})
+
+    ## deposit to the vault after approving
+    startingWhale = token.balanceOf(whale)
+    token.approve(vault, 2 ** 256 - 1, {"from": whale})
+    vault.deposit(amount, {"from": whale})
     chain.sleep(1)
-    strategy.harvest()
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
+    strategy.harvest({"from": gov})
 
-    # In order to pass this tests, you will need to implement prepareReturn.
-    # TODO: uncomment the following lines.
-    # vault.revokeStrategy(strategy.address, {"from": gov})
-    # chain.sleep(1)
-    # strategy.harvest()
-    # assert pytest.approx(token.balanceOf(vault.address), rel=RELATIVE_APPROX) == amount
+    # wait a day
+    chain.sleep(86400)
+    chain.mine(1)
 
+    vaultAssets_starting = vault.totalAssets()
+    vault_holdings_starting = token.balanceOf(vault)
+    strategy_starting = strategy.estimatedTotalAssets()
+    vault.revokeStrategy(strategy.address, {"from": gov})
 
-def test_revoke_strategy_from_strategy(
-    chain, token, vault, strategy, amount, gov, user, RELATIVE_APPROX
-):
-    # Deposit to the vault and harvest
-    token.approve(vault.address, amount, {"from": user})
-    vault.deposit(amount, {"from": user})
     chain.sleep(1)
-    strategy.harvest()
-    assert pytest.approx(strategy.estimatedTotalAssets(), rel=RELATIVE_APPROX) == amount
-
-    strategy.setEmergencyExit()
+    strategy.harvest({"from": gov})
     chain.sleep(1)
-    strategy.harvest()
-    assert pytest.approx(token.balanceOf(vault.address), rel=RELATIVE_APPROX) == amount
+    vaultAssets_after_revoke = vault.totalAssets()
+
+    # confirm we made money, or at least that we have about the same
+    assert vaultAssets_after_revoke >= vaultAssets_starting or math.isclose(
+        vaultAssets_after_revoke, vaultAssets_starting, abs_tol=5
+    )
+    assert strategy.estimatedTotalAssets() == 0
+    assert token.balanceOf(vault) >= vault_holdings_starting + strategy_starting
+
+    # simulate a day of waiting for share price to bump back up
+    chain.sleep(86400)
+    chain.mine(1)
+
+    # withdraw and confirm we made money
+    vault.withdraw({"from": whale})
+    assert token.balanceOf(whale) >= startingWhale
