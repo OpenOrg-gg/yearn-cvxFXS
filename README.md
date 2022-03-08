@@ -1,5 +1,7 @@
 # Yearn Strategy Brownie Mix
 
+For "Convex for Frax" https://hackmd.io/@-c0MLh5CTZOQ3HyKamAsvQ/rJXcEj0l9
+
 ## What you'll find here
 
 - Basic Solidity Smart Contract for creating your own Yearn Strategy ([`contracts/Strategy.sol`](contracts/Strategy.sol))
