@@ -9,8 +9,9 @@ import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/token/ERC20/SafeERC20.sol";
 import "@openzeppelin/contracts/math/Math.sol";
 
+import "./interfaces/ITradeFactory.sol";
 import "./interfaces/curve.sol";
-import {IUniswapV2Router02} from "./interfaces/uniswap.sol";
+import "./interfaces/uniswap.sol";
 import {BaseStrategy} from "@yearnvaults/contracts/BaseStrategy.sol";
 
 interface IBaseFee {
@@ -123,6 +124,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
 
     /* ========== STATE VARIABLES ========== */
     // these should stay the same across different wants.
+    address public tradeFactory = address(0);
 
     // convex stuff
     address public constant depositContract =
@@ -137,7 +139,13 @@ abstract contract StrategyConvexBase is BaseStrategy {
     address public constant voter = 0xF147b8125d2ef93FB6965Db97D6746952a133934; // Yearn's veCRV voter, we send some extra CRV here
     address public fxsVoter; // an unset voter location that must be set prior to setting a holding fee in FXS
     address public cvxVoter; // an unset voter location that must be set prior to setting a holding fee in CVX
+    address public extraRewardsFXSContract = 0x28120D9D49dBAeb5E34D6B809b842684C482EF27;
     uint256 internal constant FEE_DENOMINATOR = 10000; // this means all of our fee values are in bips
+    uint256 internal constant maxBasis = 10000;
+    IConvexRewards public IRewardsContract = IConvexRewards(rewardsContract);
+    IConvexDeposit public IDepositContract = IConvexDeposit(depositContract);
+    IConvexRewards public IFraxRewardsContract = IConvexRewards(extraRewardsFXSContract);
+
 
     // Swap stuff
     address internal constant sushiswap =
@@ -145,7 +153,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
 
     IERC20 internal constant crv =
         IERC20(0xD533a949740bb3306d119CC777fa900bA034cd52);
-    IERC20 internal constant convexToken =
+    IERC20 internal constant cvx =
         IERC20(0x4e3FBD56CD56c3e72c1403e103b45Db9da5B9D2B);
     IERC20 internal constant weth =
         IERC20(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
@@ -173,7 +181,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
 
     function stakedBalance() public view returns (uint256) {
         // how much want we have staked in Convex
-        return IConvexRewards(rewardsContract).balanceOf(address(this));
+        return IRewardsContract.balanceOf(address(this));
     }
 
     function balanceOfWant() public view returns (uint256) {
@@ -183,7 +191,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
 
     function claimableBalance() public view returns (uint256) {
         // how much CRV we can claim from the staking contract
-        return IConvexRewards(rewardsContract).earned(address(this));
+        return IRewardsContract.earned(address(this));
     }
 
     function estimatedTotalAssets() public view override returns (uint256) {
@@ -201,7 +209,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
         uint256 _toInvest = balanceOfWant();
         // deposit into convex and stake immediately but only if we have something to invest
         if (_toInvest > 0) {
-            IConvexDeposit(depositContract).deposit(pid, _toInvest, true);
+            IDepositContract.deposit(pid, _toInvest, true);
         }
     }
 
@@ -214,7 +222,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
         if (_amountNeeded > _wantBal) {
             uint256 _stakedBal = stakedBalance();
             if (_stakedBal > 0) {
-                IConvexRewards(rewardsContract).withdrawAndUnwrap(
+                IRewardsContract.withdrawAndUnwrap(
                     Math.min(_stakedBal, _amountNeeded.sub(_wantBal)),
                     claimRewards
                 );
@@ -233,7 +241,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
         uint256 _stakedBal = stakedBalance();
         if (_stakedBal > 0) {
             // don't bother withdrawing zero
-            IConvexRewards(rewardsContract).withdrawAndUnwrap(
+            IRewardsContract.withdrawAndUnwrap(
                 _stakedBal,
                 claimRewards
             );
@@ -247,7 +255,7 @@ abstract contract StrategyConvexBase is BaseStrategy {
     function withdrawToConvexDepositTokens() external onlyAuthorized {
         uint256 _stakedBal = stakedBalance();
         if (_stakedBal > 0) {
-            IConvexRewards(rewardsContract).withdraw(_stakedBal, claimRewards);
+            IRewardsContract.withdraw(_stakedBal, claimRewards);
         }
     }
 
@@ -274,14 +282,14 @@ abstract contract StrategyConvexBase is BaseStrategy {
     //Allow setting of the FXS keep amount, but ensure that an FXS Voter contract of some type has first been set.
     function setKeepFXS(uint256 _keepFXS) external onlyAuthorized {
         require(fxsVoter != address(0));
-        require(_keepFXS <= 20_000);
+        require(_keepFXS <= 10_000);
         keepFXS = _keepFXS;
     }
 
     //Allow setting of the FXS keep amount, but ensure that an FXS Voter contract of some type has first been set.
     function setKeepCVX(uint256 _keepCVX) external onlyAuthorized {
         require(cvxVoter != address(0));
-        require(_keepCVX <= 20_000);
+        require(_keepCVX <= 10_000);
         keepCVX = _keepCVX;
     }
 
@@ -322,10 +330,11 @@ abstract contract StrategyConvexBase is BaseStrategy {
 contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
     /* ========== STATE VARIABLES ========== */
     // these will likely change across different wants.
-
+    uint256 private constant max = type(uint256).max;
     ICurveFi public curve; // Curve Pool, need this for buying more pool tokens
     uint256 public maxGasPrice; // this is the max gas price we want our keepers to pay for harvests/tends in gwei
-
+    address public constant strategistMultisig = address(0x16388463d60FFE0661Cf7F1f31a7D658aC790ff7);
+    
     // Uniswap stuff
     IOracle internal constant oracle =
         IOracle(0x0F1f5A87f99f0918e6C81F16E59F3518698221Ff); // this is only needed for strats that use uniV3 for swaps
@@ -335,8 +344,6 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
     IERC20 internal constant usdt =
         IERC20(0xdAC17F958D2ee523a2206206994597C13D831ec7);
-    IERC20 internal constant fxsToken =
-        IERC20(0x3432B6A60D23Ca0dFCa7761B7ab56459D9C964D0);
 
 
     /* ========== CONSTRUCTOR ========== */
@@ -357,21 +364,6 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         // want = Curve LP
         want.approve(address(depositContract), type(uint256).max);
 
-        //Sushiswap Path Approvals
-        convexToken.approve(sushiswap, type(uint256).max);
-        crv.approve(sushiswap, type(uint256).max);
-        weth.approve(sushiswap, type(uint256).max);
-
-        //Uniswap V3 Path Approvals
-        crv.approve(uniswapv3, type(uint256).max);
-        convexToken.approve(uniswapv3, type(uint256).max);
-        weth.approve(uniswapv3, type(uint256).max);
-
-        //Uniswap V2 Path Approvals
-        crv.approve(uniswapv2, type(uint256).max);
-        convexToken.approve(uniswapv2, type(uint256).max);
-        weth.approve(uniswapv2, type(uint256).max);
-
         // set our keepCRV
         keepCRV = 1000;
 
@@ -379,12 +371,12 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         curve = ICurveFi(_curvePool);
 
         //FXS token approval for depositing into curve pool
-        fxsToken.approve(address(curve), type(uint256).max);
+        fxs.approve(address(curve), type(uint256).max);
 
         // setup our rewards contract
         pid = _pid; // this is the pool ID on convex, we use this to determine what the reweardsContract address is
         address lptoken;
-        (lptoken, , , rewardsContract, , ) = IConvexDeposit(depositContract)
+        (lptoken, , , rewardsContract, , ) = IDepositContract
             .poolInfo(_pid);
 
         // check that our LP token based on our pid matches our want
@@ -400,6 +392,10 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         maxGasPrice = 100 * 1e9;
     }
 
+event existingCrvBalanceEvent(uint256 _existingCrvBalanceEvent);
+event existingCvxBalanceEvent(uint256 _existingCvxBalanceEvent);
+event existingFxsBalanceEvent(uint256 _existingFxsBalanceEvent);
+event claimableBalanceEvent(uint256 _claimableBalanceEvent);
     /* ========== VARIABLE FUNCTIONS ========== */
     // these will likely change across different wants.
 
@@ -412,57 +408,63 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
             uint256 _debtPayment
         )
     {
+        //snapshot existing balances so we only transfer voting reserve on new tokens
+        uint256 existingCrvBalance = crv.balanceOf(address(this));
+        uint256 existingConvexBalance = cvx.balanceOf(address(this));
+        uint256 existingFxsBalance = fxs.balanceOf(address(this));
+        emit existingCrvBalanceEvent(existingCrvBalance);
+        emit existingCvxBalanceEvent(existingConvexBalance);
+        emit existingFxsBalanceEvent(existingFxsBalance);
+
+        uint256 claimableBalanceBeforeIf = claimableBalance();
+        emit claimableBalanceEvent(claimableBalanceBeforeIf);
         // if we have anything staked, then harvest CRV and CVX from the rewards contract
         if (claimableBalance() > 0) {
             // this claims our CRV, CVX, and any extra tokens like SNX or ANKR. set to false if these tokens don't exist, true if they do.
-            IConvexRewards(rewardsContract).getReward(address(this), true);
+            IRewardsContract.getReward(address(this), true);
 
             uint256 crvBalance = crv.balanceOf(address(this));
-            uint256 convexBalance = convexToken.balanceOf(address(this));
-            uint256 fxsBalance = fxsToken.balanceOf(address(this));
+            uint256 convexBalance = cvx.balanceOf(address(this));
+            uint256 fxsBalance = fxs.balanceOf(address(this));
 
             //Send CRV to voter
-            uint256 _sendToVoter = crvBalance.mul(keepCRV).div(FEE_DENOMINATOR);
-            if (_sendToVoter > 0) {
-                crv.safeTransfer(voter, _sendToVoter);
-            }
-
-            uint256 crvRemainder = crvBalance.sub(_sendToVoter);
-
-            if (crvRemainder > 0) {
-                _sellCrvforWETH(crvRemainder);
-            }
-
-            if(keepFXS > 0){
-                uint256 _sendToVoterFXS = fxsBalance.mul(keepFXS).div(FEE_DENOMINATOR);
-                if (_sendToVoterFXS > 0) {
-                    fxsToken.safeTransfer(fxsVoter, _sendToVoterFXS);
+            uint256 _sendToVoterCRV = 0;
+            if(crvBalance > existingCrvBalance){
+                uint256 crvGrowthBalance = crvBalance.sub(existingCrvBalance);
+                _sendToVoterCRV = crvGrowthBalance.mul(keepCRV).div(FEE_DENOMINATOR);
+                if (_sendToVoterCRV > 0) {
+                    crv.safeTransfer(strategistMultisig, _sendToVoterCRV);
                 }
-                fxsBalance = fxsToken.balanceOf(address(this));
             }
 
-            if (convexBalance > 0) {
-                if(keepCVX == 0){
-                    _sellConvexforWETH(convexBalance);
-                } else {
-                    uint256 _sendToVoterCVX = convexBalance.mul(keepCVX).div(FEE_DENOMINATOR);
-                     if (_sendToVoterCVX > 0) {
-                        convexToken.safeTransfer(cvxVoter, _sendToVoterCVX);
+            //Send FXS to voter
+            if(keepFXS > 0){
+                uint256 _sendToVoterFXS = 0;
+                if(fxsBalance > existingFxsBalance){
+                    uint256 fxsGrowthBalance = fxsBalance.sub(existingFxsBalance);
+                    _sendToVoterFXS = fxsGrowthBalance.mul(keepFXS).div(FEE_DENOMINATOR);
+                    if (_sendToVoterFXS > 0) {
+                        fxs.safeTransfer(strategistMultisig, _sendToVoterFXS);
                     }
                 }
-                    convexBalance = convexToken.balanceOf(address(this));
             }
 
-            // convert our WETH to fxs, but don't want to swap dust
-            uint256 _wethBalance = weth.balanceOf(address(this));
-            uint256 _fxsBalance = 0;
-            if (_wethBalance > 0) {
-                _fxsBalance = _sellWethForFXS(_wethBalance);
+            //Send CVX to voter
+            if(keepCVX > 0){
+                uint256 _sendToVoterCVX = 0;
+                if(convexBalance > existingConvexBalance){
+                    uint256 cvxGrowthBalance = convexBalance.sub(existingConvexBalance);
+                    _sendToVoterCVX = cvxGrowthBalance.mul(keepCVX).div(FEE_DENOMINATOR);
+                    if (_sendToVoterCVX > 0) {
+                        cvx.safeTransfer(strategistMultisig, _sendToVoterCVX);
+                    }
+                }
             }
 
             // deposit our FXS to Curve if we have any
-            if (_fxsBalance > 0) {
-                curve.add_liquidity([0, _fxsBalance], 0);
+            fxsBalance = fxs.balanceOf(address(this));
+            if (fxsBalance > 0) {
+                curve.add_liquidity([0, fxsBalance], 0);
             }
         }
 
@@ -470,7 +472,7 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         if (_debtOutstanding > 0) {
             uint256 _stakedBal = stakedBalance();
             if (_stakedBal > 0) {
-                IConvexRewards(rewardsContract).withdrawAndUnwrap(
+                IRewardsContract.withdrawAndUnwrap(
                     Math.min(_stakedBal, _debtOutstanding),
                     claimRewards
                 );
@@ -501,68 +503,22 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         forceHarvestTriggerOnce = false;
     }
 
-    // Sells our harvested CRV into the selected output.
-    function _sellCrvforWETH(uint256 _amount) internal {
-        address[] memory crvPath = new address[](2);
-        crvPath[0] = address(crv);
-        crvPath[1] = address(weth);
-        IUniswapV2Router02(sushiswap).swapExactTokensForTokens(
-            _amount,
-            uint256(0),
-            crvPath,
-            address(this),
-            block.timestamp
-        );
-    }
-
-    // Sells our harvested CVX into the selected output.
-    function _sellConvexforWETH(uint256 _amount) internal {
-        address[] memory convexTokenPath = new address[](2);
-        convexTokenPath[0] = address(convexToken);
-        convexTokenPath[1] = address(weth);
-        IUniswapV2Router02(sushiswap).swapExactTokensForTokens(
-            _amount,
-            uint256(0),
-            convexTokenPath,
-            address(this),
-            block.timestamp
-        );
-    }
-
-    // Sells our WETH for FXS
-    function _sellWethForFXS(uint256 _amount) internal returns (uint256) {
-        uint256 _fxsOutput =
-            IUniV3(uniswapv3).exactInput(
-                IUniV3.ExactInputParams(
-                    abi.encodePacked(
-                        address(weth),
-                        uint24(500),
-                        address(fxsToken)
-                    ),
-                    address(this),
-                    block.timestamp,
-                    _amount,
-                    uint256(1)
-                )
-            );
-        return _fxsOutput;
-    }
-
     // migrate our want token to a new strategy if needed, make sure to check claimRewards first
     // also send over any CRV or CVX that is claimed; for migrations we definitely want to claim
     function prepareMigration(address _newStrategy) internal override {
         uint256 _stakedBal = stakedBalance();
         if (_stakedBal > 0) {
-            IConvexRewards(rewardsContract).withdrawAndUnwrap(
+            IRewardsContract.withdrawAndUnwrap(
                 _stakedBal,
                 claimRewards
             );
         }
         crv.safeTransfer(_newStrategy, crv.balanceOf(address(this)));
-        convexToken.safeTransfer(
+        cvx.safeTransfer(
             _newStrategy,
-            convexToken.balanceOf(address(this))
+            cvx.balanceOf(address(this))
         );
+        fxs.safeTransfer(_newStrategy, fxs.balanceOf(address(this)));
     }
 
     /* ========== KEEP3RS ========== */
@@ -609,12 +565,12 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         uint256 totalCliffs = 1_000;
         uint256 maxSupply = 100 * 1_000_000 * 1e18; // 100mil
         uint256 reductionPerCliff = 100_000 * 1e18; // 100,000
-        uint256 supply = convexToken.totalSupply();
+        uint256 supply = cvx.totalSupply();
         uint256 mintableCvx;
 
         uint256 cliff = supply.div(reductionPerCliff);
         uint256 _claimableBal = claimableBalance();
-        uint256 extraRewardsFXS = IConvexRewards(0x28120D9D49dBAeb5E34D6B809b842684C482EF27).earned(address(this));
+        uint256 extraRewardsFXS = IFraxRewardsContract.earned(address(this));
         //mint if below total cliffs
         if (cliff < totalCliffs) {
             //for reduction% take inverse of current cliff
@@ -635,12 +591,12 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
         crv_usd_path[2] = address(usdt);
 
         address[] memory cvx_usd_path = new address[](3);
-        cvx_usd_path[0] = address(convexToken);
+        cvx_usd_path[0] = address(cvx);
         cvx_usd_path[1] = address(weth);
         cvx_usd_path[2] = address(usdt);
 
         address[] memory fxs_usd_path = new address[](3);
-        fxs_usd_path[0] = address(fxsToken);
+        fxs_usd_path[0] = address(fxs);
         fxs_usd_path[1] = address(weth);
         fxs_usd_path[2] = address(usdt);
 
@@ -687,7 +643,7 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
     {
         uint256 callCostInWant;
         if (_ethAmount > 0) {
-            address fxsCall = address(fxsToken);
+            address fxsCall = address(fxs);
             uint256 callCostInFXS =
                 oracle.ethToAsset(_ethAmount, fxsCall, 1800);
             callCostInWant = curve.calc_token_amount([0, callCostInFXS], true);
@@ -700,5 +656,34 @@ contract StrategyConvexFraxcvxFXS is StrategyConvexBase {
     // set the maximum gas price we want to pay for a harvest/tend in gwei
     function setGasPrice(uint256 _maxGasPrice) external onlyAuthorized {
         maxGasPrice = _maxGasPrice.mul(1e9);
+    }
+
+    // ----------------- YSWAPS FUNCTIONS ---------------------
+
+    function setTradeFactory(address _tradeFactory) external onlyGovernance {
+        if (tradeFactory != address(0)) {
+            _removeTradeFactoryPermissions();
+        }
+
+        // approve and set up trade factory
+        crv.safeApprove(_tradeFactory, max);
+        cvx.safeApprove(_tradeFactory, max);
+        fxs.safeApprove(_tradeFactory, max);
+        ITradeFactory tf = ITradeFactory(_tradeFactory);
+        tf.enable(address(crv), address(want));
+        tf.enable(address(cvx), address(want));
+        tf.enable(address(fxs), address(want));
+        tradeFactory = _tradeFactory;
+    }
+
+    function removeTradeFactoryPermissions() external onlyEmergencyAuthorized {
+        _removeTradeFactoryPermissions();
+    }
+
+    function _removeTradeFactoryPermissions() internal {
+        crv.safeApprove(tradeFactory, 0);
+        cvx.safeApprove(tradeFactory, 0);
+        fxs.safeApprove(tradeFactory, 0);
+        tradeFactory = address(0);
     }
 }
